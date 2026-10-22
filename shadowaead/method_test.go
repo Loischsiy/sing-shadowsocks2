@@ -200,7 +200,7 @@ func TestPrefixSaltUDP(t *testing.T) {
 		{"chacha20", "chacha20-ietf-poly1305", []byte("HTTP/1.1 ")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m, err := NewMethod(tc.method, C.MethodOptions{Password: "[REDACTED]", PrefixSalt: tc.prefix})
+			m, err := NewMethod(tc.method, C.MethodOptions{Password: "[REDACTED]", PrefixSaltUDP: tc.prefix})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -258,5 +258,75 @@ func TestPrefixSaltUDP(t *testing.T) {
 				t.Fatal("WritePacket: salt tail is not random")
 			}
 		})
+	}
+}
+
+// udpSalt sends one packet through WriteTo and returns its salt as seen on the wire.
+func udpSalt(t *testing.T, m *Method) []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	destination := M.ParseSocksaddr("1.2.3.4:5353")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.DialPacketConn(client).WriteTo([]byte("x"), destination.UDPAddr())
+		errCh <- err
+	}()
+	salt, _, _ := readUDPPacket(t, m, server)
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	return salt
+}
+
+// TestPrefixSaltTCPUDPIndependent checks that TCP and UDP prefixes do not leak into each other.
+func TestPrefixSaltTCPUDPIndependent(t *testing.T) {
+	tcpPrefix := []byte("POST ")
+	udpPrefix := []byte{0x6b, 0x7b, 0x01, 0x20}
+
+	both, err := NewMethod("aes-128-gcm", C.MethodOptions{Password: "[REDACTED]", PrefixSalt: tcpPrefix, PrefixSaltUDP: udpPrefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if salt := dialSalt(t, both, both.keySaltLength); !bytes.HasPrefix(salt, tcpPrefix) {
+		t.Fatalf("TCP salt must start with the TCP prefix: %x", salt)
+	}
+	if salt := udpSalt(t, both); !bytes.HasPrefix(salt, udpPrefix) {
+		t.Fatalf("UDP salt must start with the UDP prefix: %x", salt)
+	}
+
+	// Only the TCP prefix is set: UDP must keep a fully random salt.
+	tcpOnly, err := NewMethod("aes-128-gcm", C.MethodOptions{Password: "[REDACTED]", PrefixSalt: tcpPrefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if salt := udpSalt(t, tcpOnly); bytes.HasPrefix(salt, tcpPrefix) {
+		t.Fatalf("TCP prefix must not be applied to UDP: %x", salt)
+	}
+
+	// Only the UDP prefix is set: TCP must keep a fully random salt.
+	udpOnly, err := NewMethod("aes-128-gcm", C.MethodOptions{Password: "[REDACTED]", PrefixSaltUDP: udpPrefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if salt := dialSalt(t, udpOnly, udpOnly.keySaltLength); bytes.HasPrefix(salt, udpPrefix) {
+		t.Fatalf("UDP prefix must not be applied to TCP: %x", salt)
+	}
+}
+
+func TestPrefixSaltUDPTooLong(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		length int
+	}{
+		{"aes-128-gcm", 16},
+		{"aes-128-gcm", 17},
+		{"aes-256-gcm", 32},
+	} {
+		_, err := NewMethod(tc.method, C.MethodOptions{Password: "[REDACTED]", PrefixSaltUDP: make([]byte, tc.length)})
+		if err == nil {
+			t.Fatalf("%s: expected error for UDP prefix length %d", tc.method, tc.length)
+		}
 	}
 }
