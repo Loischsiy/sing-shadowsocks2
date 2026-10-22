@@ -64,6 +64,7 @@ type Method struct {
 	keySaltLength int
 	constructor   func(key []byte) (cipher.AEAD, error)
 	key           []byte
+	prefixSalt    []byte
 }
 
 func NewMethod(methodName string, options C.MethodOptions) (*Method, error) {
@@ -145,6 +146,12 @@ func NewMethod(methodName string, options C.MethodOptions) (*Method, error) {
 	} else {
 		m.key = legacykey.Key([]byte(options.Password), m.keySaltLength)
 	}
+	if len(options.PrefixSalt) > 0 {
+		if len(options.PrefixSalt) >= m.keySaltLength {
+			return nil, E.New("prefix length must be less than salt length")
+		}
+		m.prefixSalt = append([]byte(nil), options.PrefixSalt...)
+	}
 	return m, nil
 }
 
@@ -156,6 +163,14 @@ func aeadCipher(block func(key []byte) (cipher.Block, error), aead func(block ci
 		}
 		return aead(b)
 	}
+}
+
+// writeSalt writes a salt of keySaltLength bytes: prefixSalt followed by random bytes.
+func (m *Method) writeSalt(buffer *buf.Buffer) {
+	if len(m.prefixSalt) > 0 {
+		common.Must1(buffer.Write(m.prefixSalt))
+	}
+	buffer.WriteRandom(m.keySaltLength - len(m.prefixSalt))
 }
 
 func (m *Method) DialConn(conn net.Conn, destination M.Socksaddr) (net.Conn, error) {
@@ -198,7 +213,7 @@ type clientConn struct {
 
 func (c *clientConn) writeRequest(payload []byte) error {
 	requestBuffer := buf.New()
-	requestBuffer.WriteRandom(c.method.keySaltLength)
+	c.method.writeSalt(requestBuffer)
 	key := make([]byte, c.method.keySaltLength)
 	legacykey.Kdf(c.method.key, requestBuffer.Bytes(), key)
 	writeCipher, err := c.method.constructor(key)
@@ -341,7 +356,7 @@ func (c *clientPacketConn) readPacket(buffer *buf.Buffer) (destination M.Socksad
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	header := buf.With(buffer.ExtendHeader(c.method.keySaltLength + M.SocksaddrSerializer.AddrPortLen(destination)))
-	header.WriteRandom(c.method.keySaltLength)
+	c.method.writeSalt(header)
 	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
 	if err != nil {
 		return err
@@ -396,7 +411,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	destination := M.SocksaddrFromNet(addr)
 	buffer := buf.NewSize(c.method.keySaltLength + M.SocksaddrSerializer.AddrPortLen(destination) + len(p) + shadowio.Overhead)
 	defer buffer.Release()
-	buffer.WriteRandom(c.method.keySaltLength)
+	c.method.writeSalt(buffer)
 	err = M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
 	if err != nil {
 		return

@@ -19,6 +19,10 @@ type MethodOptions struct {
 	Key      []byte
 	KeyList  [][]byte
 	TimeFunc func() time.Time
+	// PrefixSalt is an optional fixed prefix for AEAD salts (Outline-style).
+	// The salt length is unchanged: salt = PrefixSalt || random bytes.
+	// Only used by the shadowaead methods.
+	PrefixSalt []byte
 }
 
 type MethodCreator func(methodName string, options MethodOptions) (Method, error)
