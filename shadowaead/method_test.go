@@ -8,6 +8,8 @@ import (
 
 	C "github.com/metacubex/sing-shadowsocks2/cipher"
 	"github.com/metacubex/sing-shadowsocks2/internal/legacykey"
+	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/buf"
 	M "github.com/metacubex/sing/common/metadata"
 )
 
@@ -149,5 +151,112 @@ func TestPrefixSaltTooLong(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%s: expected error for prefix length %d", tc.method, tc.length)
 		}
+	}
+}
+
+// readUDPPacket reads one packet from the wire and decrypts it the way a server does:
+// the key is derived from the full salt (prefix included).
+func readUDPPacket(t *testing.T, m *Method, wire net.Conn) (salt []byte, destination M.Socksaddr, payload []byte) {
+	t.Helper()
+	packet := make([]byte, 65535)
+	n, err := wire.Read(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet = packet[:n]
+	if n < m.keySaltLength {
+		t.Fatal("packet too short")
+	}
+	salt = append([]byte(nil), packet[:m.keySaltLength]...)
+	key := make([]byte, m.keySaltLength)
+	legacykey.Kdf(m.key, salt, key)
+	aead, err := m.constructor(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := aead.Open(nil, make([]byte, aead.NonceSize()), packet[m.keySaltLength:], nil)
+	if err != nil {
+		t.Fatalf("server failed to decrypt with full-salt KDF: %v", err)
+	}
+	reader := buf.As(plain)
+	destination, err = M.SocksaddrSerializer.ReadAddrPort(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return salt, destination, append([]byte(nil), reader.Bytes()...)
+}
+
+func TestPrefixSaltUDP(t *testing.T) {
+	destination := M.ParseSocksaddr("1.2.3.4:5353")
+	payload := []byte("hello udp")
+	for _, tc := range []struct {
+		name   string
+		method string
+		prefix []byte
+	}{
+		{"no-prefix", "aes-128-gcm", nil},
+		{"aes-128-gcm", "aes-128-gcm", []byte("POST ")},
+		{"aes-256-gcm", "aes-256-gcm", []byte{0x16, 0x03, 0x01, 0x02}},
+		{"chacha20", "chacha20-ietf-poly1305", []byte("HTTP/1.1 ")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := NewMethod(tc.method, C.MethodOptions{Password: "[REDACTED]", PrefixSalt: tc.prefix})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			packetConn := m.DialPacketConn(client)
+
+			check := func(send func() error) []byte {
+				errCh := make(chan error, 1)
+				go func() { errCh <- send() }()
+				salt, dest, got := readUDPPacket(t, m, server)
+				if err := <-errCh; err != nil {
+					t.Fatal(err)
+				}
+				if len(salt) != m.keySaltLength {
+					t.Fatalf("unexpected salt length %d", len(salt))
+				}
+				if !bytes.Equal(salt[:len(tc.prefix)], tc.prefix) {
+					t.Fatalf("salt does not start with prefix: %x", salt)
+				}
+				if dest.String() != destination.String() {
+					t.Fatalf("unexpected destination %s", dest)
+				}
+				if !bytes.Equal(got, payload) {
+					t.Fatalf("unexpected payload %q", got)
+				}
+				return salt
+			}
+
+			// WriteTo
+			salt1 := check(func() error {
+				_, err := packetConn.WriteTo(payload, destination.UDPAddr())
+				return err
+			})
+			salt2 := check(func() error {
+				_, err := packetConn.WriteTo(payload, destination.UDPAddr())
+				return err
+			})
+			if bytes.Equal(salt1[len(tc.prefix):], salt2[len(tc.prefix):]) {
+				t.Fatal("WriteTo: salt tail is not random")
+			}
+
+			// WritePacket
+			writePacket := func() error {
+				front := m.keySaltLength + M.SocksaddrSerializer.AddrPortLen(destination)
+				buffer := buf.NewSize(front + len(payload) + 16)
+				buffer.Resize(front, 0)
+				common.Must1(buffer.Write(payload))
+				return packetConn.WritePacket(buffer, destination)
+			}
+			salt3 := check(writePacket)
+			salt4 := check(writePacket)
+			if bytes.Equal(salt3[len(tc.prefix):], salt4[len(tc.prefix):]) {
+				t.Fatal("WritePacket: salt tail is not random")
+			}
+		})
 	}
 }
